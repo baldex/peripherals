@@ -41,6 +41,7 @@ contract MiniChefV2 is BoringOwnable, BoringBatchable {
         uint128 accSushiPerShare;
         uint64 lastRewardTime;
         uint64 allocPoint;
+        uint16 depositFeeBP;
     }
 
     /// @notice Address of SUSHI contract.
@@ -67,18 +68,25 @@ contract MiniChefV2 is BoringOwnable, BoringBatchable {
     uint256 public sushiPerSecond;
     uint256 private constant ACC_SUSHI_PRECISION = 1e12;
 
+    // Deposit Fee address
+    address public feeAddress;
+    /// @notice Maximum deposit fee rate: 2%
+    uint16 public constant MAXIMUM_DEPOSIT_FEE_RATE = 200;
+
     event Deposit(address indexed user, uint256 indexed pid, uint256 amount, address indexed to);
     event Withdraw(address indexed user, uint256 indexed pid, uint256 amount, address indexed to);
     event EmergencyWithdraw(address indexed user, uint256 indexed pid, uint256 amount, address indexed to);
     event Harvest(address indexed user, uint256 indexed pid, uint256 amount);
-    event LogPoolAddition(uint256 indexed pid, uint256 allocPoint, IERC20 indexed lpToken, IRewarder indexed rewarder);
-    event LogSetPool(uint256 indexed pid, uint256 allocPoint, IRewarder indexed rewarder, bool overwrite);
+    event LogPoolAddition(uint256 indexed pid, uint256 allocPoint, IERC20 indexed lpToken, IRewarder indexed rewarder, uint16 depositFeeBP);
+    event LogSetPool(uint256 indexed pid, uint256 allocPoint, IRewarder indexed rewarder, bool overwrite, uint16 depositFeeBP);
     event LogUpdatePool(uint256 indexed pid, uint64 lastRewardTime, uint256 lpSupply, uint256 accSushiPerShare);
     event LogSushiPerSecond(uint256 sushiPerSecond);
+    event SetFeeAddress(address indexed user, address indexed newAddress);
 
     /// @param _sushi The SUSHI token contract address.
-    constructor(IERC20 _sushi) {
+    constructor(IERC20 _sushi, address _feeAddress) {
         SUSHI = _sushi;
+        feeAddress = _feeAddress;
     }
 
     /// @notice Returns the number of MCV2 pools.
@@ -91,15 +99,16 @@ contract MiniChefV2 is BoringOwnable, BoringBatchable {
     /// @param allocPoint AP of the new pool.
     /// @param _lpToken Address of the LP ERC-20 token.
     /// @param _rewarder Address of the rewarder delegate.
-    function add(uint256 allocPoint, IERC20 _lpToken, IRewarder _rewarder) public onlyOwner {
+    function add(uint256 allocPoint, IERC20 _lpToken, IRewarder _rewarder, uint16 _depositFeeBP) public onlyOwner {
         require(addedTokens[address(_lpToken)] == false, "Token already added");
+        require(_depositFeeBP <= MAXIMUM_DEPOSIT_FEE_RATE, "add: invalid deposit fee basis points");
         totalAllocPoint = totalAllocPoint.add(allocPoint);
         lpToken.push(_lpToken);
         rewarder.push(_rewarder);
 
-        poolInfo.push(PoolInfo({allocPoint: allocPoint.to64(), lastRewardTime: block.timestamp.to64(), accSushiPerShare: 0}));
+        poolInfo.push(PoolInfo({allocPoint: allocPoint.to64(), lastRewardTime: block.timestamp.to64(), accSushiPerShare: 0, depositFeeBP : _depositFeeBP}));
         addedTokens[address(_lpToken)] = true;
-        emit LogPoolAddition(lpToken.length.sub(1), allocPoint, _lpToken, _rewarder);
+        emit LogPoolAddition(lpToken.length.sub(1), allocPoint, _lpToken, _rewarder, _depositFeeBP);
     }
 
     /// @notice Update the given pool's SUSHI allocation point and `IRewarder` contract. Can only be called by the owner.
@@ -107,13 +116,15 @@ contract MiniChefV2 is BoringOwnable, BoringBatchable {
     /// @param _allocPoint New AP of the pool.
     /// @param _rewarder Address of the rewarder delegate.
     /// @param overwrite True if _rewarder should be `set`. Otherwise `_rewarder` is ignored.
-    function set(uint256 _pid, uint256 _allocPoint, IRewarder _rewarder, bool overwrite) public onlyOwner {
+    function set(uint256 _pid, uint256 _allocPoint, IRewarder _rewarder, bool overwrite, uint16 _depositFeeBP) public onlyOwner {
+        require(_depositFeeBP <= MAXIMUM_DEPOSIT_FEE_RATE, "set: deposit fee too high");
         totalAllocPoint = totalAllocPoint.sub(poolInfo[_pid].allocPoint).add(_allocPoint);
         poolInfo[_pid].allocPoint = _allocPoint.to64();
+        poolInfo[_pid].depositFeeBP = _depositFeeBP;
         if (overwrite) {
             rewarder[_pid] = _rewarder;
         }
-        emit LogSetPool(_pid, _allocPoint, overwrite ? _rewarder : rewarder[_pid], overwrite);
+        emit LogSetPool(_pid, _allocPoint, overwrite ? _rewarder : rewarder[_pid], overwrite, _depositFeeBP);
     }
 
     /// @notice Sets the sushi per second to be distributed. Can only be called by the owner.
@@ -196,17 +207,24 @@ contract MiniChefV2 is BoringOwnable, BoringBatchable {
         PoolInfo memory pool = updatePool(pid);
         UserInfo storage user = userInfo[pid][to];
 
+        lpToken[pid].safeTransferFrom(msg.sender, address(this), amount);
+
+        uint256 amountAfterFee = amount;
+        if (pool.depositFeeBP > 0) {
+            uint256 depositFee = amount.mul(pool.depositFeeBP) / 10000;
+            lpToken[pid].safeTransfer(feeAddress, depositFee);
+            amountAfterFee = amountAfterFee.sub(depositFee);
+        }
+
         // Effects
-        user.amount = user.amount.add(amount);
-        user.rewardDebt = user.rewardDebt.add(int256(amount.mul(pool.accSushiPerShare) / ACC_SUSHI_PRECISION));
+        user.amount = user.amount.add(amountAfterFee);
+        user.rewardDebt = user.rewardDebt.add(int256(amountAfterFee.mul(pool.accSushiPerShare) / ACC_SUSHI_PRECISION));
 
         // Interactions
         IRewarder _rewarder = rewarder[pid];
         if (address(_rewarder) != address(0)) {
             _rewarder.onSushiReward(pid, to, to, 0, user.amount);
         }
-
-        lpToken[pid].safeTransferFrom(msg.sender, address(this), amount);
 
         emit Deposit(msg.sender, pid, amount, to);
     }
@@ -304,5 +322,11 @@ contract MiniChefV2 is BoringOwnable, BoringBatchable {
         // Note: transfer can fail or succeed if `amount` is zero.
         lpToken[pid].safeTransfer(to, amount);
         emit EmergencyWithdraw(msg.sender, pid, amount, to);
+    }
+
+    function setFeeAddress(address _feeAddress) public {
+        require(msg.sender == feeAddress, "setFeeAddress: FORBIDDEN");
+        feeAddress = _feeAddress;
+        emit SetFeeAddress(msg.sender, _feeAddress);
     }
 }
