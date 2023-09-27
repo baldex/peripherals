@@ -9,12 +9,6 @@ import "libraries/SignedSafeMath.sol";
 import "interfaces/IRewarder.sol";
 import "interfaces/IMasterChef.sol";
 
-interface IMigratorChef {
-    // Take the current LP token address and return the new LP token address.
-    // Migrator should have full access to the caller's LP token.
-    function migrate(IERC20 token) external returns (IERC20);
-}
-
 /// @notice The (older) MasterChef contract gives out a constant number of SUSHI tokens per block.
 /// It is the only address with minting rights for SUSHI.
 /// The idea for this MasterChef V2 (MCV2) contract is therefore to be the owner of a dummy token
@@ -46,8 +40,6 @@ contract MiniChefV2 is BoringOwnable, BoringBatchable {
 
     /// @notice Address of SUSHI contract.
     IERC20 public immutable SUSHI;
-    // @notice The migrator contract. It has a lot of power. Can only be set through governance (owner).
-    IMigratorChef public migrator;
 
     /// @notice Info of each MCV2 pool.
     PoolInfo[] public poolInfo;
@@ -132,27 +124,6 @@ contract MiniChefV2 is BoringOwnable, BoringBatchable {
     function setSushiPerSecond(uint256 _sushiPerSecond) public onlyOwner {
         sushiPerSecond = _sushiPerSecond;
         emit LogSushiPerSecond(_sushiPerSecond);
-    }
-
-    /// @notice Set the `migrator` contract. Can only be called by the owner.
-    /// @param _migrator The contract address to set.
-    function setMigrator(IMigratorChef _migrator) public onlyOwner {
-        migrator = _migrator;
-    }
-
-    /// @notice Migrate LP token to another LP contract through the `migrator` contract.
-    /// @param _pid The index of the pool. See `poolInfo`.
-    function migrate(uint256 _pid) public {
-        require(address(migrator) != address(0), "MasterChefV2: no migrator set");
-        IERC20 _lpToken = lpToken[_pid];
-        uint256 bal = _lpToken.balanceOf(address(this));
-        _lpToken.approve(address(migrator), bal);
-        IERC20 newLpToken = migrator.migrate(_lpToken);
-        require(bal == newLpToken.balanceOf(address(this)), "MasterChefV2: migrated balance must match");
-        require(addedTokens[address(newLpToken)] == false, "Token already added");
-        addedTokens[address(newLpToken)] = true;
-        addedTokens[address(_lpToken)] = false;
-        lpToken[_pid] = newLpToken;
     }
 
     /// @notice View function to see pending SUSHI on frontend.
